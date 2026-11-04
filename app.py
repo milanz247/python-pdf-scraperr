@@ -52,9 +52,13 @@ DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 REQUEST_TIMEOUT = 30
 TOR_BOOTSTRAP_TIMEOUT = 120
 PDF_MAGIC = b"%PDF-"
-AHMIA_ONION = "http://juhanurmih5wuprs4fazzd2uv5phvdicnnst4x4tfdgahdit2h3vdyd.onion"
+AHMIA_ONION = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion"
 AHMIA_CLEAR = "https://ahmia.fi"
 DDG_HTML = "https://html.duckduckgo.com/html/"
+DDG_LITE = "https://lite.duckduckgo.com/lite/"
+ARCHIVE_SEARCH = "https://archive.org/advancedsearch.php"
+ARCHIVE_METADATA = "https://archive.org/metadata/"
+ARCHIVE_DOWNLOAD = "https://archive.org/download/"
 TOR_CHECK = "https://check.torproject.org/api/ip"
 TOR_DIST = "https://dist.torproject.org/torbrowser/"
 USER_AGENTS = (
@@ -160,7 +164,10 @@ class TorRuntime:
     def local_binary(self) -> Path | None:
         name = "tor.exe" if os.name == "nt" else "tor"
         if self.bin_dir.is_dir():
-            matches = sorted(self.bin_dir.rglob(name), key=lambda p: len(p.parts))
+            matches = sorted(
+                (path for path in self.bin_dir.rglob(name) if path.is_file()),
+                key=lambda path: ("debug" in path.parts, len(path.parts), str(path)),
+            )
             return matches[0].resolve() if matches else None
         return None
 
@@ -328,6 +335,13 @@ class TorRuntime:
             command.extend((f"--{key}", value))
         command.extend(("__OwningControllerProcess", str(os.getpid())))
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        environment = os.environ.copy()
+        if platform.system() == "Linux" and self.bin_dir.resolve() in binary.parents:
+            library_dir = str(binary.parent)
+            existing_library_path = environment.get("LD_LIBRARY_PATH")
+            environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+                part for part in (library_dir, existing_library_path) if part
+            )
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -337,6 +351,7 @@ class TorRuntime:
             errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            env=environment,
         )
         self.process = process
         lines: queue.Queue[str | None] = queue.Queue()
@@ -516,15 +531,85 @@ def routed_get(url: str, clear: Session, tor: Session, **kwargs: Any) -> Request
 def search_clearweb(query: str, clear: Session, limit: int) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for dork in (f'{query} filetype:pdf', f'{query} intitle:"index of" pdf'):
-        response = http_request(
-            clear, "POST", DDG_HTML, data={"q": dork}, timeout=REQUEST_TIMEOUT,
-            allow_redirects=False,
-        )
-        response.raise_for_status()
-        found.extend(result_links(response.content, response.url))
+        for endpoint in (DDG_HTML, DDG_LITE):
+            response = http_request(
+                clear, "GET", endpoint, params={"q": dork}, timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+            if response.status_code != 200:
+                LOG.warning(
+                    "Clear-web search endpoint returned HTTP %s: %s",
+                    response.status_code,
+                    endpoint,
+                )
+                continue
+            links = result_links(response.text, response.url)
+            if links:
+                found.extend(links)
+                break
         if len(found) >= limit * 3:
             break
     return deduplicate(found)[: limit * 3]
+
+
+def search_public_archive(query: str, clear: Session, limit: int) -> list[tuple[str, str]]:
+    """Find directly downloadable, unrestricted PDFs in Internet Archive."""
+    escaped = query.replace("\\", "\\\\").replace('"', '\\"')
+    response = http_request(
+        clear,
+        "GET",
+        ARCHIVE_SEARCH,
+        params={
+            "q": f'title:("{escaped}") AND mediatype:texts',
+            "fl[]": ("identifier", "title"),
+            "rows": min(10, max(1, limit)),
+            "output": "json",
+        },
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    try:
+        documents = response.json().get("response", {}).get("docs", [])
+    except (TypeError, ValueError) as exc:
+        raise RequestException(f"Public archive returned invalid JSON: {exc}") from exc
+
+    found: list[tuple[str, str]] = []
+    for document in documents:
+        identifier = str(document.get("identifier", "")).strip()
+        title = " ".join(str(document.get("title", "")).split())
+        if not identifier or not title or match_score(query, "", title) == 0:
+            continue
+        metadata_response = http_request(
+            clear,
+            "GET",
+            f"{ARCHIVE_METADATA}{quote(identifier, safe='')}",
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+        metadata_response.raise_for_status()
+        try:
+            payload = metadata_response.json()
+        except ValueError as exc:
+            raise RequestException(f"Public archive metadata was invalid: {exc}") from exc
+        restricted = str(payload.get("metadata", {}).get("access-restricted-item", "")).lower()
+        if restricted in {"1", "true", "yes"}:
+            continue
+        files = sorted(
+            payload.get("files", []),
+            key=lambda item: (str(item.get("source", "")).lower() != "original", str(item.get("name", ""))),
+        )
+        for item in files:
+            name = str(item.get("name", "")).strip()
+            private = str(item.get("private", "")).lower()
+            if not name.lower().endswith(".pdf") or private in {"1", "true", "yes"}:
+                continue
+            url = f"{ARCHIVE_DOWNLOAD}{quote(identifier, safe='')}/{quote(name, safe='/')}"
+            found.append((url, title))
+            break
+        if len(found) >= limit:
+            break
+    return found
 
 
 def search_darkweb(query: str, clear: Session, tor: Session, limit: int) -> list[tuple[str, str]]:
@@ -537,7 +622,7 @@ def search_darkweb(query: str, clear: Session, tor: Session, limit: int) -> list
             )
             response.raise_for_status()
             own_host = urlparse(base).hostname
-            links = [item for item in result_links(response.content, response.url)
+            links = [item for item in result_links(response.text, response.url)
                      if urlparse(item[0]).hostname != own_host]
             if links:
                 return deduplicate(links)[: limit * 4]
@@ -653,6 +738,11 @@ def run_search(job_id: str, max_bytes: int) -> None:
             clear_candidates.extend(search_clearweb(job.query, clear, 10))
         except RequestException as exc:
             LOG.warning("Clear-web search failed: %s", exc)
+        update_job(job_id, "Searching public PDF archives…")
+        try:
+            clear_candidates.extend(search_public_archive(job.query, clear, 10))
+        except RequestException as exc:
+            LOG.warning("Public archive search failed: %s", exc)
 
         def ranked(items: list[tuple[str, str]]) -> list[tuple[str, str]]:
             return sorted(

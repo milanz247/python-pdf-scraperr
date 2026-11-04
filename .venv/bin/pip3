@@ -1,4 +1,4 @@
-#!/home/milan/projects/scaperpdf/.venv/bin/python
+#!/home/milan/project/python-pdf-scraperr/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

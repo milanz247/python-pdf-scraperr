@@ -1,4 +1,4 @@
-#!/home/milan/projects/scaperpdf/.venv/bin/python
+#!/home/milan/project/python-pdf-scraperr/.venv/bin/python
 import sys
 from idna.cli import main
 if __name__ == '__main__':
